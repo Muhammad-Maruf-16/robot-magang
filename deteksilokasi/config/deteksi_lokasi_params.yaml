@@ -1,0 +1,15 @@
+deteksi_lokasi_node:
+  ros__parameters:
+    scan_topic: /scan_filtered     # scan yang sudah difilter (badan robot dibuang), sama seperti robotpel
+    auto_on_start: true            # langsung cari lokasi saat program jalan
+    start_delay_s: 3.0             # tunggu sebentar supaya LiDAR dan AMCL siap
+    accept_score: 0.65             # skor minimum (0-1) supaya hasil dipercaya dan dikirim ke AMCL
+    accept_margin: 0.05            # hasil terbaik harus lebih unggul segini dari tempat lain yang mirip
+    retry_seconds: 5.0             # hasil ragu -> coba lagi setelah ini
+    lost_score: 0.40               # scan vs posisi sekarang di bawah ini = robot kemungkinan dipindah
+    lost_seconds: 3.0              # ... selama ini
+    still_odom_m: 0.05             # roda dianggap diam (robot diangkat, bukan jalan sendiri)
+    stable_scan_m: 0.08            # scan dianggap stabil = robot sudah ditaruh
+    cooldown_s: 8.0                # jeda minimum antar pencarian
+    search_stride_m: 0.15          # jarak antar posisi yang dicoba
+    search_angle_step_deg: 5.0     # jarak antar arah yang dicoba

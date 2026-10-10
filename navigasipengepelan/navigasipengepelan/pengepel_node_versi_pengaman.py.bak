@@ -1,0 +1,859 @@
+#!/usr/bin/env python3
+"""pengepel_node -- robot mengepel seluruh area kosong peta secara otomatis
+(zig-zag / boustrophedon), lalu kembali ke titik awal.
+
+Cara jalan robot memakai logika robotfixproblemkembali3 yang sudah terbukti
+(turunan kelasnya, kembali3 sendiri TIDAK diubah): koreksi jalur, berhenti
+kalau ada halangan di depan, tombol darurat SPASI (/emergency_stop), titik
+yang terlewat tetap dihitung. Yang berbeda dari kembali3:
+  * titik jalur dibuat otomatis oleh coverage.py dari peta, bukan diklik;
+  * di ujung tiap baris robot BERHENTI dan berputar di tempat ke baris berikutnya;
+  * di akhir tidak menyusuri balik rute -- rute sudah termasuk jalan pulang.
+
+Batas area (kaca yang tembus LiDAR, dsb.): klik titik-titik sudut area dengan
+tool "Publish Point" di RViz, berurutan. Disimpan ke boundary_file dan dipakai
+lagi otomatis. Rute pratinjau diperbarui tiap titik ditambah. Hapus batas:
+Empty ke /pengepelan/hapus_batas (tombol H).
+
+Mulai: kirim Empty ke /pengepelan/mulai (tombol G di kontrol_pengepelan.py),
+atau klik "2D Goal Pose" di RViz. Rute dibuat ulang dari posisi robot saat itu.
+"""
+
+import math
+import os
+import time
+from typing import List, Optional
+
+import yaml
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import Point, PoseStamped
+from nav_msgs.msg import OccupancyGrid
+from scipy import ndimage
+from sensor_msgs.msg import LaserScan
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Empty, String
+from visualization_msgs.msg import Marker
+
+from robotfixproblemkembali3.manual_waypoint_driver_node import (
+    MOTOR_NEUTRAL,
+    SPIN_LEFT,
+    SPIN_RIGHT,
+    DriveState,
+    ManualWaypointDriverNode,
+    Waypoint,
+    normalize_angle,
+    sector_min_range,
+)
+
+from navigasipengepelan.coverage import Geodesic, GridMap, _nearest_inside, _simplify, plan_coverage
+
+
+class PengepelNode(ManualWaypointDriverNode):
+    def __init__(self) -> None:
+        self.grid_map: Optional[GridMap] = None
+        self.plan_status = "menunggu peta dan posisi robot"
+        self.boundary: List[tuple] = []
+        self.wp_kinds: List[str] = []
+        self.previewed = False
+        self.plan_mask: Optional[np.ndarray] = None
+        self.real_scan: Optional[LaserScan] = None
+        self.detour_attempts = 0
+        self.blocked_since: Optional[float] = None
+        self.route_len_at_start = 0
+        self.mopped: Optional[np.ndarray] = None
+        self.replans = 0
+        self._steer_tick = 0
+        self._prog_xy: Optional[tuple] = None
+        self._prog_at = 0.0  # mulai terhalang di titik ini (total, tidak diulang tiap berhenti)
+        super().__init__()
+        p = self.declare_parameter
+        p("map_topic", "/map")
+        p("row_spacing_m", 0.40)        # lebar pel 50 cm, tumpang tindih 10 cm
+        p("wall_clearance_m", 0.30)     # titik tengah robot minimal segini dari dinding/benda besar
+        p("min_obstacle_m2", 0.04)      # benda lebih kecil dari ini diabaikan saat membuat rute (LiDAR tetap jaga saat jalan)
+        p("max_hole_m2", 0.5)           # lubang "tidak dikenal" sekecil ini di tengah area dianggap kosong
+        p("densify_m", 1.0)             # titik tambahan tiap segini di baris panjang
+        p("corner_deg", 45.0)           # belokan lebih tajam dari ini = berhenti lalu putar di tempat
+        # Ujung baris selalu dekat dinding, dan kembali3 berhenti kalau ada dinding
+        # < 0.65 m di depan LiDAR -> ujung baris dianggap tercapai kalau dinding di
+        # depan menghalangi dan jaraknya ke titik ujung tinggal segini.
+        p("corner_wall_reach_m", 0.6)
+        p("row_end_extra_m", 0.20)      # ujung baris dimundurkan segini dari dinding/batas di depan (moncong robot)
+        p("obstacle_skip_s", 8.0)       # terhalang di tengah baris lebih lama dari ini -> lewati sisa baris
+        p("min_row_len_m", 0.5)         # potongan baris lebih pendek dari ini dibuang (rute lebih rapi)
+        # Garis batas: titik tengah robot dijaga segini dari batas saat membuat rute
+        # (badan 25 cm + toleransi melenceng), dan saat jalan batas disisipkan ke
+        # data LiDAR sebagai dinding virtual (logika pengaman kembali3 ikut bekerja).
+        p("boundary_clearance_m", 0.45)
+        p("virtual_wall", False)
+        p("boundary_guard_m", 0.35)     # tengah robot sedekat ini ke batas & mengarah ke batas -> berhenti maju, putar menjauh
+        p("laser_yaw_rad", math.pi)     # mount LiDAR robot ini (sama dengan kembali3: sudut + pi)
+        # Menghindar: terhalang lebih lama dari avoid_wait_s -> cari jalan memutar
+        # (penghalang dari LiDAR dijauhi avoid_inflate_m), lalu kembali ke rute.
+        # kembali3 hanya berhenti untuk halangan depan kalau sedang lurus; saat sedikit
+        # mengoreksi arah halangan diabaikan -> bisa menabrak orang. Pengepelan selalu
+        # berhenti kalau ada apa pun di sektor depan selebar badan.
+        p("front_guard_half_width_m", 0.30)  # lebar "jalur badan" di depan yang diperiksa (badan 25 cm + 5 cm)
+        p("avoid_wait_s", 2.0)
+        p("avoid_inflate_m", 0.35)
+        p("avoid_max_attempts", 3)
+        p("outer_gentle", 92)           # roda luar saat koreksi halus (lebih cepat dari 97)
+        p("outer_sharp", 87)            # roda luar saat koreksi tajam
+        p("max_replans", 20)            # batas berapa kali rute dibuat ulang dalam satu pengepelan
+        p("boundary_file", os.path.expanduser("~/Robot magang/navigasipengepelan/maps/batas_area.yaml"))
+        gp = lambda n: self.get_parameter(n).value  # noqa: E731
+        self.row_spacing_m = float(gp("row_spacing_m"))
+        self.wall_clearance_m = float(gp("wall_clearance_m"))
+        self.min_obstacle_m2 = float(gp("min_obstacle_m2"))
+        self.max_hole_m2 = float(gp("max_hole_m2"))
+        self.densify_m = float(gp("densify_m"))
+        self.corner_rad = math.radians(float(gp("corner_deg")))
+        self.corner_wall_reach_m = float(gp("corner_wall_reach_m"))
+        self.obstacle_skip_s = float(gp("obstacle_skip_s"))
+        self.row_end_extra_m = float(gp("row_end_extra_m"))
+        self.min_row_len_m = float(gp("min_row_len_m"))
+        self.boundary_file = str(gp("boundary_file"))
+        self.boundary_clearance_m = float(gp("boundary_clearance_m"))
+        self.virtual_wall = bool(gp("virtual_wall"))
+        self.boundary_guard_m = float(gp("boundary_guard_m"))
+        self.laser_yaw_rad = float(gp("laser_yaw_rad"))
+        self.front_guard_half_width_m = float(gp("front_guard_half_width_m"))
+        self.avoid_wait_s = float(gp("avoid_wait_s"))
+        self.avoid_inflate_m = float(gp("avoid_inflate_m"))
+        self.avoid_max_attempts = int(gp("avoid_max_attempts"))
+        self.outer_gentle = int(gp("outer_gentle"))
+        self.outer_sharp = int(gp("outer_sharp"))
+        self.max_replans = int(gp("max_replans"))
+        self._load_boundary()
+        map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
+        self.create_subscription(OccupancyGrid, str(gp("map_topic")), self.on_map, map_qos)
+        self.create_subscription(Empty, "/pengepelan/mulai", lambda _m: self.mulai(), 10)
+        self.create_subscription(Empty, "/pengepelan/hapus_batas", lambda _m: self.hapus_batas(), 10)
+        self.create_subscription(Empty, "/pengepelan/lihat_rute", lambda _m: self.pratinjau(), 10)
+        self.create_timer(1.0, self._auto_preview)
+        self.create_timer(1.0, self._publish_boundary_marker)
+        self.status_pub = self.create_publisher(String, "/pengepelan/status", 10)
+        self.create_timer(1.0, lambda: self.status_pub.publish(String(data=self.plan_status)))
+        self.get_logger().info("pengepel_node siap -- tekan G (atau klik 2D Goal Pose) untuk mulai mengepel.")
+
+    # ------------------------------------------------------------ input
+    def on_map(self, msg: OccupancyGrid) -> None:
+        grid = np.asarray(msg.data, dtype=np.int16).reshape(msg.info.height, msg.info.width)
+        self.grid_map = GridMap(grid, msg.info.resolution, msg.info.origin.position.x, msg.info.origin.position.y)
+        k = max(1, int(round(0.15 / msg.info.resolution)))
+        yy, xx = np.ogrid[-k:k + 1, -k:k + 1]
+        self.static_occ = ndimage.binary_dilation(grid >= 65, structure=(xx * xx + yy * yy) <= k * k)
+        self.get_logger().info(f"Peta diterima {msg.info.width}x{msg.info.height}.")
+
+    def on_clicked_point(self, msg) -> None:
+        """Klik "Publish Point" = tambah satu titik sudut batas area."""
+        if self.state not in (DriveState.WAITING_POINTS, DriveState.FINISHED):
+            self.get_logger().warn("Sedang mengepel -- batas area tidak bisa diubah sekarang.")
+            return
+        self.boundary.append((float(msg.point.x), float(msg.point.y)))
+        self._save_boundary()
+        self.get_logger().info(f"Titik batas area {len(self.boundary)}: ({msg.point.x:.2f}, {msg.point.y:.2f})")
+        self._publish_boundary_marker()
+        if len(self.boundary) >= 3:
+            self.pratinjau()
+
+    def hapus_batas(self) -> None:
+        if self.state not in (DriveState.WAITING_POINTS, DriveState.FINISHED):
+            self.get_logger().warn("Sedang mengepel -- batas area tidak bisa dihapus sekarang.")
+            return
+        self.boundary = []
+        try:
+            os.remove(self.boundary_file)
+        except OSError:
+            pass
+        self.get_logger().info("Batas area dihapus -- seluruh peta dipakai.")
+        self._publish_boundary_marker()
+        self.pratinjau()
+
+    def _load_boundary(self) -> None:
+        try:
+            with open(self.boundary_file) as f:
+                pts = (yaml.safe_load(f) or {}).get("batas", [])
+            self.boundary = [(float(x), float(y)) for x, y in pts]
+            if self.boundary:
+                self.get_logger().info(f"Batas area dimuat: {len(self.boundary)} titik dari {self.boundary_file}")
+        except (OSError, yaml.YAMLError, TypeError, ValueError):
+            self.boundary = []
+
+    def _save_boundary(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.boundary_file), exist_ok=True)
+            with open(self.boundary_file, "w") as f:
+                yaml.safe_dump({"batas": [[x, y] for x, y in self.boundary]}, f)
+        except OSError as exc:
+            self.get_logger().warn(f"Batas area tidak bisa disimpan: {exc}")
+
+    def on_start_trigger(self, msg: PoseStamped) -> None:
+        self.mulai()
+
+    def on_scan(self, msg: LaserScan) -> None:
+        """Scan asli disimpan untuk menghindar; logika jalan kembali3 memakai scan
+        yang sudah ditambah dinding virtual dari garis batas."""
+        self.real_scan = msg
+        if self.virtual_wall and len(self.boundary) >= 3 and self.current_pose is not None:
+            msg = self._with_virtual_walls(msg)
+        self.latest_scan = msg
+
+    def _with_virtual_walls(self, msg: LaserScan) -> LaserScan:
+        x, y, yaw = self.current_pose
+        n = len(msg.ranges)
+        ang = yaw + self.laser_yaw_rad + msg.angle_min + msg.angle_increment * np.arange(n)
+        dx, dy = np.cos(ang), np.sin(ang)
+        pts = np.array(self.boundary + self.boundary[:1], dtype=float)
+        qx, qy = pts[:-1, 0], pts[:-1, 1]
+        ex, ey = pts[1:, 0] - qx, pts[1:, 1] - qy
+        # sinar p + t*d  vs  sisi q + s*e
+        den = dx[:, None] * ey[None, :] - dy[:, None] * ex[None, :]
+        wx, wy = qx[None, :] - x, qy[None, :] - y
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = (wx * ey[None, :] - wy * ex[None, :]) / den
+            sp = (wx * dy[:, None] - wy * dx[:, None]) / den
+        ok = (np.abs(den) > 1e-9) & (t > 0) & (sp >= 0) & (sp <= 1)
+        t = np.where(ok, t, np.inf).min(axis=1)
+        real = np.asarray(msg.ranges, dtype=float)
+        real = np.where(np.isfinite(real) & (real >= msg.range_min), real, np.inf)
+        merged = np.minimum(real, np.where(t <= msg.range_max, t, np.inf))
+        out = LaserScan()
+        out.header = msg.header
+        out.angle_min, out.angle_max, out.angle_increment = msg.angle_min, msg.angle_max, msg.angle_increment
+        out.time_increment, out.scan_time = msg.time_increment, msg.scan_time
+        out.range_min, out.range_max = msg.range_min, msg.range_max
+        out.ranges = [float(v) for v in merged]
+        return out
+
+    def _load_saved_waypoints(self) -> None:
+        pass
+
+    def _save_waypoints(self, waypoints) -> None:
+        pass
+
+    def _smooth_path(self, waypoints):
+        return list(waypoints)
+
+    # ------------------------------------------------------------ rute
+    def _make_plan(self) -> bool:
+        """Buat rute dari posisi robot sekarang -> self.waypoints (+ jenisnya)."""
+        if self.grid_map is None or self.current_pose is None:
+            self.get_logger().warn("Belum bisa membuat rute: peta atau posisi robot belum ada (tunggu deteksi lokasi).")
+            return False
+        sx, sy, _ = self.current_pose
+        plan = plan_coverage(
+            self.grid_map, (sx, sy), self.row_spacing_m, self.wall_clearance_m,
+            min_row_len_m=self.min_row_len_m, min_obstacle_m2=self.min_obstacle_m2,
+            max_hole_m2=self.max_hole_m2, boundary=self.boundary if len(self.boundary) >= 3 else None,
+            boundary_extra_m=max(0.0, self.boundary_clearance_m - self.wall_clearance_m),
+            row_end_extra_m=self.row_end_extra_m,
+        )
+        self.plan_mask = plan.area_mask
+        for note in plan.notes:
+            self.get_logger().warn(note)
+        if not plan.waypoints:
+            self.get_logger().error("Rute kosong -- tidak ada area yang bisa dipel dari posisi ini.")
+            return False
+        self.waypoints, self.wp_kinds = self._to_waypoints([(sx, sy, "row")] + [(w.x, w.y, w.kind) for w in plan.waypoints])
+        self.waypoints, self.wp_kinds = self.waypoints[1:], self.wp_kinds[1:]
+        self.current_index = 0
+        batas = f", batas area {len(self.boundary)} titik" if len(self.boundary) >= 3 else ""
+        self.plan_info = (
+            f"{len(plan.rows)} baris, pel {plan.coverage_length_m:.0f} m, "
+            f"pindah {plan.travel_length_m:.0f} m, arah baris {math.degrees(plan.angle_rad):.0f} deg{batas}"
+        )
+        return True
+
+    def pratinjau(self) -> None:
+        if self.state not in (DriveState.WAITING_POINTS, DriveState.FINISHED):
+            return
+        if self._make_plan():
+            self.previewed = True
+            self.plan_status = f"PRATINJAU {self.plan_info} -- tekan G untuk mulai"
+            self.get_logger().info(f"Rute pratinjau: {self.plan_info}")
+
+    def _auto_preview(self) -> None:
+        if not self.previewed and self.grid_map is not None and self.current_pose is not None:
+            self.pratinjau()
+
+    def mulai(self) -> None:
+        if self.state not in (DriveState.WAITING_POINTS, DriveState.FINISHED):
+            self.get_logger().warn("Sedang mengepel -- perintah mulai diabaikan.")
+            return
+        self.get_logger().info("Membuat rute pengepelan dari peta...")
+        if not self._make_plan():
+            return
+        sx, sy, _ = self.current_pose
+        self.plan_status = f"MENGEPEL {self.plan_info}"
+        self.get_logger().info(f"Rute siap: {self.plan_info}, {len(self.waypoints)} titik.")
+        self._mission_start_xy = (sx, sy)
+        self.route_len_at_start = len(self.waypoints)
+        self.mopped = np.zeros((self.grid_map.h, self.grid_map.w), dtype=bool)
+        self.replans = 0
+        self.current_index = 0
+        self._returning = True  # matikan jendela lurus-di-awal dan putar-balik bawaan kembali3
+        self._start_straight_until = None
+        self._enter(DriveState.TURNING)
+
+    def _to_waypoints(self, pts: List[tuple]):
+        """Tambah titik antara di baris panjang; tandai belokan tajam (ujung baris)
+        sebagai hard_corner supaya robot berhenti dan berputar di sana.
+        pts: (x, y, jenis). Hasil: (daftar Waypoint, daftar jenis)."""
+        dense: List[tuple] = [pts[0][:2]]
+        kinds: List[str] = [pts[0][2]]
+        for a, b in zip(pts, pts[1:]):
+            n = max(1, int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / self.densify_m)))
+            for k in range(1, n + 1):
+                dense.append((a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n))
+                kinds.append(b[2])
+        out: List[Waypoint] = []
+        for i, p in enumerate(dense):
+            corner = True
+            if 0 < i < len(dense) - 1:
+                h_in = math.atan2(p[1] - dense[i - 1][1], p[0] - dense[i - 1][0])
+                h_out = math.atan2(dense[i + 1][1] - p[1], dense[i + 1][0] - p[0])
+                corner = abs(math.atan2(math.sin(h_out - h_in), math.cos(h_out - h_in))) > self.corner_rad
+            out.append(Waypoint(x=p[0], y=p[1], hard_corner=corner))
+        return out, kinds
+
+    # ------------------------------------------------------------ loop kontrol
+    def control_loop(self) -> None:
+        """Sama seperti kembali3, kecuali: berhenti + putar di tempat di setiap
+        hard_corner (ujung baris), dan selesai di titik terakhir (sudah titik awal)."""
+        if self.state in (DriveState.WAITING_POINTS, DriveState.FINISHED):
+            return
+        if self._emergency_stop:
+            self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+            return
+        if self.current_pose is None:
+            self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+            return
+        for _ in range(10):
+            target = self.waypoints[self.current_index]
+            x, y, _yaw = self.current_pose
+            dx, dy = target.x - x, target.y - y
+            dist = math.hypot(dx, dy)
+            is_last = self.current_index == len(self.waypoints) - 1
+            if is_last:
+                reached = self._end_reached(x, y, target, dist)
+            elif target.hard_corner:
+                reached = self._corner_reached(x, y, target, dist)
+            else:
+                reached = self._passed_point(x, y, target)
+            if dist > self.waypoint_tolerance_m and not reached:
+                break
+            is_detour = self.current_index < len(self.wp_kinds) and self.wp_kinds[self.current_index] == "detour"
+            if not is_detour:
+                self.blocked_since = None
+            if dist > self.waypoint_tolerance_m:
+                # Dianggap tercapai dari jauh (dinding di depan / sudah lewat):
+                # ruas berikutnya dimulai dari posisi robot yang SEBENARNYA, supaya
+                # robot tidak mengira dirinya melenceng jauh dari garis.
+                self.waypoints[self.current_index] = Waypoint(x=x, y=y, hard_corner=target.hard_corner)
+            self.current_index += 1
+            if not is_detour:
+                self.detour_attempts = 0
+            # Batas waktu kembali3 (drive_timeout_s) dihitung sejak MASUK mode
+            # jalan, bukan per titik -- baris panjang tanpa jeda membuatnya
+            # "timeout" palsu lalu melompati titik (bisa ujung baris). Ulang
+            # timernya tiap titik tercapai supaya benar-benar per titik.
+            self._state_entered_at = time.monotonic()
+            if self.current_index >= len(self.waypoints):
+                # Sebelum selesai: masih ada lantai belum dipel yang SEKARANG bisa
+                # dicapai (mis. orang yang menghalangi sudah pergi)? Pel dulu.
+                self.current_index = len(self.waypoints) - 1
+                if self.replan("Kembali di titik awal, masih ada area belum dipel", need_rows=True):
+                    return
+                self.current_index = len(self.waypoints)
+                self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+                self._enter(DriveState.FINISHED)
+                self.plan_status = "SELESAI -- robot sudah kembali ke titik awal"
+                self.get_logger().info("Selesai mengepel -- robot sudah kembali ke titik awal.")
+                return
+            self.get_logger().info(
+                f"Titik {self.current_index}/{len(self.waypoints)}" + (" (ujung baris)" if target.hard_corner else ""),
+                throttle_duration_sec=0.5,
+            )
+            if target.hard_corner and self.state in (DriveState.DRIVING, DriveState.PAUSED_OBSTACLE):
+                nxt = self.waypoints[self.current_index]
+                self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+                self._enter(DriveState.TURNING)
+                dx, dy = nxt.x - x, nxt.y - y
+                break
+        if self.state == DriveState.DRIVING and self._boundary_guard(dx, dy):
+            return
+        if self._no_progress():
+            self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+            self._enter(DriveState.TURNING)
+            return
+        if self.state == DriveState.DRIVING and math.hypot(dx, dy) > 0.3:
+            # Arah melenceng jauh dari titik tujuan: berhenti & putar rapi di tempat,
+            # bukan berputar sambil "jalan" (yang dianggap macet lalu mundur).
+            err = normalize_angle(math.atan2(dy, dx) - self.current_pose[2])
+            if abs(err) > math.radians(60.0):
+                self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+                self._enter(DriveState.TURNING)
+                return
+        if self.state == DriveState.DRIVING and self.latest_scan is not None:
+            front = self._front_body_distance(self.latest_scan)
+            if front < self.front_stop_from_lidar_m:
+                err = normalize_angle(math.atan2(dy, dx) - self.current_pose[2])
+                if not self._dynamic_blocker() and abs(err) > math.radians(12.0) and math.hypot(dx, dy) > 0.3:
+                    # Dinding peta di depan karena arah robot melenceng: luruskan arah
+                    # (putar di tempat ke jalur), jangan berhenti.
+                    self.get_logger().info(
+                        f"Dinding {front:.2f} m di depan, arah melenceng {math.degrees(err):.0f} deg -- luruskan.",
+                        throttle_duration_sec=1.0,
+                    )
+                    self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+                    self._enter(DriveState.TURNING)
+                    return
+                self.get_logger().warn(
+                    f"Ada halangan {front:.2f} m di depan -- berhenti.", throttle_duration_sec=1.0
+                )
+                self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+                self._enter(DriveState.PAUSED_OBSTACLE)
+                return
+        if self.state == DriveState.PAUSED_OBSTACLE:
+            if self.blocked_since is None:
+                self.blocked_since = time.monotonic()
+            dynamic = self._dynamic_blocker()
+            if not dynamic and self._near_row_end(1.0):
+                # Dinding di peta / garis batas di depan, dan ujung baris sudah dekat:
+                # tidak perlu ditunggu atau dikelilingi -> baris selesai di sini.
+                self.end_row_here()
+                return
+            if not dynamic:
+                tw = self.waypoints[self.current_index]
+                if math.hypot(tw.x - self.current_pose[0], tw.y - self.current_pose[1]) <= self.corner_wall_reach_m:
+                    # Titik tujuan dekat dinding & sudah dekat: anggap tercapai (bukan
+                    # memutar-mutar) -- ruas berikutnya mulai dari posisi nyata.
+                    x0, y0, _ = self.current_pose
+                    self.waypoints[self.current_index] = Waypoint(x=x0, y=y0, hard_corner=True)
+                    self.current_index = min(self.current_index + 1, len(self.waypoints) - 1)
+                    self.blocked_since = None
+                    self._enter(DriveState.TURNING)
+                    return
+            waited = time.monotonic() - self.blocked_since
+            # Benda baru (orang/barang): tunggu dulu, siapa tahu pergi. Dinding/batas
+            # di tengah jalan tidak akan pergi -> langsung cari jalan memutar.
+            wait_needed = self.avoid_wait_s if dynamic else 0.0
+            route_ok = len(self.waypoints) <= 2 * self.route_len_at_start + 20  # rute tidak boleh membengkak
+            if waited >= wait_needed and self.detour_attempts < self.avoid_max_attempts and route_ok:
+                self.detour_attempts += 1
+                if self.try_detour():
+                    return
+            if waited > self.obstacle_skip_s:
+                self.skip_rest_of_row()
+                return
+        if self.state == DriveState.TURNING:
+            self._do_turning(dx, dy)
+        elif self.state == DriveState.DRIVING:
+            self._do_driving(dx, dy)
+        elif self.state == DriveState.PAUSED_OBSTACLE:
+            self._do_paused_obstacle()
+        elif self.state == DriveState.REVERSING:
+            self._do_reversing()
+
+    def _publish_motor(self, kiri: int, kanan: int) -> None:
+        """Koreksi arah SAMBIL TERUS JALAN. Koreksi kembali3 (GENTLE 107 / SHARP 117)
+        menghentikan satu roda -- di robot ini satu roda saja tidak kuat (encoder
+        diam, macet). Diganti: roda dalam tetap 97, roda LUAR sedikit lebih cepat
+        (92 halus / 87 tajam; nilai yang terbukti bergerak di pelcdx) -> robot
+        melengkung mulus, kedua roda selalu maju, tidak berhenti."""
+        if self.state == DriveState.DRIVING:
+            dead = lambda b: 97 < b < 157  # noqa: E731
+            if kiri == 97 and dead(kanan):      # roda kanan "pelan" -> belok kanan: kiri lebih cepat
+                kiri, kanan = (self.outer_sharp if kanan >= 112 else self.outer_gentle), 97
+            elif kanan == 97 and dead(kiri):    # roda kiri "pelan" -> belok kiri: kanan lebih cepat
+                kiri, kanan = 97, (self.outer_sharp if kiri >= 112 else self.outer_gentle)
+        super()._publish_motor(kiri, kanan)
+        if self.state == DriveState.DRIVING and kiri <= 97 and kanan <= 97:
+            self._mark_mopped()
+
+    def _mark_mopped(self) -> None:
+        """Catat lantai yang terkena pel (lingkaran 25 cm = setengah lebar pel)."""
+        if self.mopped is None or self.grid_map is None or self.current_pose is None:
+            return
+        m = self.grid_map
+        r, c = m.to_cell(self.current_pose[0], self.current_pose[1])
+        k = int(round(0.25 / m.res))
+        r0, r1, c0, c1 = max(0, r - k), min(m.h, r + k + 1), max(0, c - k), min(m.w, c + k + 1)
+        if r0 >= r1 or c0 >= c1:
+            return
+        yy, xx = np.ogrid[r0 - r:r1 - r, c0 - c:c1 - c]
+        self.mopped[r0:r1, c0:c1] |= (yy * yy + xx * xx) <= k * k
+
+    def replan(self, reason: str, need_rows: bool = False) -> bool:
+        """Buat ulang rute dari posisi SEKARANG untuk lantai yang BELUM dipel,
+        menghindari halangan yang sedang terlihat LiDAR, lalu pulang ke titik awal.
+        Garis biru di RViz ikut berubah."""
+        if self.replans >= self.max_replans or self.grid_map is None or self.current_pose is None:
+            return False
+        self.replans += 1
+        m = self.grid_map
+        blocked = None
+        if self.real_scan is not None:
+            x, y, yaw = self.current_pose
+            sc = self.real_scan
+            r = np.asarray(sc.ranges, dtype=float)
+            a = yaw + self.laser_yaw_rad + sc.angle_min + sc.angle_increment * np.arange(len(r))
+            ok = np.isfinite(r) & (r > sc.range_min) & (r < min(sc.range_max, 4.0))
+            px, py = x + r[ok] * np.cos(a[ok]), y + r[ok] * np.sin(a[ok])
+            rr = ((py - m.oy) / m.res).astype(int)
+            cc = ((px - m.ox) / m.res).astype(int)
+            inside = (rr >= 0) & (rr < m.h) & (cc >= 0) & (cc < m.w)
+            blocked = np.zeros((m.h, m.w), dtype=bool)
+            blocked[rr[inside], cc[inside]] = True
+            k = int(round(self.avoid_inflate_m / m.res))
+            yy, xx = np.ogrid[-k:k + 1, -k:k + 1]
+            blocked = ndimage.binary_dilation(blocked, structure=(xx * xx + yy * yy) <= k * k)
+            blocked &= ~self.static_occ  # dinding peta sudah dijaga oleh area aman
+        sx, sy, _ = self.current_pose
+        plan = plan_coverage(
+            m, (sx, sy), self.row_spacing_m, self.wall_clearance_m,
+            min_row_len_m=self.min_row_len_m, min_obstacle_m2=self.min_obstacle_m2,
+            max_hole_m2=self.max_hole_m2, boundary=self.boundary if len(self.boundary) >= 3 else None,
+            boundary_extra_m=max(0.0, self.boundary_clearance_m - self.wall_clearance_m),
+            row_end_extra_m=self.row_end_extra_m, done_mask=self.mopped, blocked_mask=blocked,
+            home_xy=self._mission_start_xy,
+        )
+        if not plan.waypoints or (need_rows and not any(w.kind == "row" for w in plan.waypoints)):
+            return False
+        self.plan_mask = plan.area_mask
+        wps, kinds = self._to_waypoints([(sx, sy, "row")] + [(w.x, w.y, w.kind) for w in plan.waypoints])
+        self.waypoints, self.wp_kinds = wps[1:], kinds[1:]
+        self.current_index = 0
+        self.blocked_since = None
+        self.detour_attempts = 0
+        self.route_len_at_start = len(self.waypoints)
+        self.plan_status = f"MENGEPEL (rute dibuat ulang ke-{self.replans}) sisa {len(plan.rows)} baris"
+        self.get_logger().warn(
+            f"{reason} -- rute dibuat ulang dari posisi sekarang: sisa {len(plan.rows)} baris belum dipel, "
+            f"{len(self.waypoints)} titik."
+        )
+        self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+        self._enter(DriveState.TURNING)
+        return True
+
+    def _no_progress(self) -> bool:
+        """Mode jalan tapi tidak berpindah > 3 cm dalam 4 detik -> luruskan arah
+        (BUKAN mundur)."""
+        now = time.monotonic()
+        x, y, _ = self.current_pose
+        if self.state != DriveState.DRIVING or self._prog_xy is None:
+            self._prog_xy, self._prog_at = (x, y), now
+            return False
+        if math.hypot(x - self._prog_xy[0], y - self._prog_xy[1]) > 0.03:
+            self._prog_xy, self._prog_at = (x, y), now
+            return False
+        if now - self._prog_at > 4.0:
+            self._prog_xy, self._prog_at = (x, y), now
+            self.get_logger().warn("Tidak berpindah 4 detik -- berputar meluruskan arah.")
+            return True
+        return False
+
+    def _boundary_guard(self, dx: float, dy: float) -> bool:
+        """Penjaga garis batas: badan robot tidak boleh menyentuh batas. Kalau titik
+        tengah robot < boundary_guard_m dari batas DAN sedang mengarah ke batas,
+        jangan maju: putar di tempat menghadap menjauh (campuran arah menjauhi
+        batas dan arah ke titik tujuan). Putar di tempat tidak menggeser posisi."""
+        if len(self.boundary) < 3:
+            return False
+        x, y, yaw = self.current_pose
+        best = (float("inf"), 0.0, 0.0)
+        pts = self.boundary + self.boundary[:1]
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            vx, vy = bx - ax, by - ay
+            L2 = vx * vx + vy * vy
+            if L2 < 1e-9:
+                continue
+            t = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / L2))
+            qx, qy = ax + t * vx, ay + t * vy
+            d = math.hypot(x - qx, y - qy)
+            if d < best[0]:
+                best = (d, qx, qy)
+        d, qx, qy = best
+        if d >= self.boundary_guard_m or d < 1e-6:
+            return False
+        nx, ny = (x - qx) / d, (y - qy) / d          # arah menjauhi batas
+        hx, hy = math.cos(yaw), math.sin(yaw)
+        if hx * nx + hy * ny > -0.1:                # tidak mengarah ke batas -> boleh jalan
+            return False
+        tl = math.hypot(dx, dy) or 1.0
+        gx, gy = nx + dx / tl, ny + dy / tl          # menjauh + ke arah tujuan
+        if gx * nx + gy * ny <= 0.2:                 # tujuan di balik batas -> menjauh saja
+            gx, gy = nx, ny
+        err = normalize_angle(math.atan2(gy, gx) - yaw)
+        self.get_logger().warn(
+            f"Penjaga batas: {d:.2f} m dari garis batas -- berputar menjauh dulu.", throttle_duration_sec=1.0
+        )
+        self._publish_motor(*(SPIN_LEFT if err > 0 else SPIN_RIGHT))
+        self._last_progress_check_at = time.monotonic()  # berputar bukan macet
+        return True
+
+    def _do_turning(self, dx: float, dy: float) -> None:
+        """Putar di tempat menghadap titik berikutnya. Selesai kalau arah sudah dalam
+        toleransi ATAU baru saja MELEWATI target (tanda selisih berubah): satu langkah
+        kontrol bisa memutar robot lebih dari 2x toleransi, sehingga versi kembali3
+        bisa bolak-balik melewati target terus sampai batas waktu habis."""
+        _, _, yaw = self.current_pose
+        err = normalize_angle(math.atan2(dy, dx) - yaw)
+        elapsed = time.monotonic() - self._state_entered_at
+        prev = self._turn_prev if getattr(self, "_turn_prev_at", None) == self._state_entered_at else None
+        crossed = prev is not None and (err > 0) != (prev > 0) and abs(err) < 0.6
+        if abs(err) <= self.turn_pivot_tolerance_rad or crossed or elapsed >= self.turn_pivot_timeout_s:
+            self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+            self._enter(DriveState.DRIVING)
+            return
+        self._turn_prev, self._turn_prev_at = err, self._state_entered_at
+        self._publish_motor(*(SPIN_LEFT if err > 0 else SPIN_RIGHT))
+
+    def _corner_reached(self, x: float, y: float, target: Waypoint, dist: float) -> bool:
+        if self._passed_point(x, y, target):
+            return True
+        if dist <= self.corner_wall_reach_m and self.latest_scan is not None:
+            front = sector_min_range(self.latest_scan, 180.0, self.front_sector_deg)
+            return front < self.front_stop_from_lidar_m + self.front_clear_margin_m
+        return False
+
+    def _front_body_distance(self, scan: LaserScan) -> float:
+        """Jarak ke benda terdekat di JALUR SELEBAR BADAN tepat di depan robot
+        (|samping| < front_guard_half_width_m). Bukan sektor sudut: dinding samping
+        di lorong sempit tidak ikut terhitung, hanya yang benar-benar akan tertabrak."""
+        r = np.asarray(scan.ranges, dtype=float)
+        a = self.laser_yaw_rad + scan.angle_min + scan.angle_increment * np.arange(len(r))
+        ok = np.isfinite(r) & (r > scan.range_min)
+        fx, fy = r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])
+        hit = (fx > 0.0) & (np.abs(fy) < self.front_guard_half_width_m)
+        if np.count_nonzero(hit) < 2:  # satu titik nyasar bukan halangan
+            return float("inf")
+        return float(np.sort(fx[hit])[1])
+
+    def _do_paused_obstacle(self) -> None:
+        """Lanjut jalan hanya kalau sektor depan SELEBAR BADAN (sama dengan pengaman
+        depan) benar-benar kosong, dengan ambang lebih longgar dari ambang berhenti --
+        kalau beda sektor/ambang, robot berhenti-jalan-berhenti terus (chattering)."""
+        self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+        if self.latest_scan is None:
+            return
+        front = self._front_body_distance(self.latest_scan)
+        if front >= self.front_stop_from_lidar_m + self.front_clear_margin_m:
+            self.get_logger().info("Jalan sudah kosong -- lanjut.")
+            self._enter(DriveState.DRIVING)
+
+    def try_detour(self) -> bool:
+        """Jalan memutar mengelilingi penghalang yang terlihat LiDAR (orang, barang),
+        di dalam area aman rute, menuju titik rute berikutnya yang tidak terhalang."""
+        if self.plan_mask is None or self.grid_map is None or self.real_scan is None or self.current_pose is None:
+            return False
+        m, scan = self.grid_map, self.real_scan
+        x, y, yaw = self.current_pose
+        r = np.asarray(scan.ranges, dtype=float)
+        a = yaw + self.laser_yaw_rad + scan.angle_min + scan.angle_increment * np.arange(len(r))
+        ok = np.isfinite(r) & (r > scan.range_min) & (r < min(scan.range_max, 4.0))
+        px, py = x + r[ok] * np.cos(a[ok]), y + r[ok] * np.sin(a[ok])
+        blocked = np.zeros_like(self.plan_mask)
+        rr = ((py - m.oy) / m.res).astype(int)
+        cc = ((px - m.ox) / m.res).astype(int)
+        inside = (rr >= 0) & (rr < m.h) & (cc >= 0) & (cc < m.w)
+        blocked[rr[inside], cc[inside]] = True
+        k = int(round(self.avoid_inflate_m / m.res))
+        yy, xx = np.ogrid[-k:k + 1, -k:k + 1]
+        blocked = ndimage.binary_dilation(blocked, structure=(xx * xx + yy * yy) <= k * k)
+        free = self.plan_mask & ~blocked
+        if not free.any():
+            return False
+        start = _nearest_inside(free, m.to_cell(x, y))
+        geo = Geodesic(free, m.res)
+        geo.run(start)
+        # Utamakan kembali ke baris yang sedang dikerjakan (titik terdekat dulu), tapi
+        # TIDAK kaku: boleh lewat area yang sudah dipel dan lanjut ke titik rute
+        # berikutnya yang bisa dicapai (permintaan operator: ada toleransi).
+        for j in range(self.current_index, min(len(self.waypoints), self.current_index + 25)):
+            w = self.waypoints[j]
+            if math.hypot(w.x - x, w.y - y) < 0.6:
+                continue
+            cell = m.to_cell(w.x, w.y)
+            if not (0 <= cell[0] < m.h and 0 <= cell[1] < m.w) or not free[cell]:
+                continue
+            path = geo.path(cell)
+            if path is None:
+                continue
+            length = geo.distance_m(cell)
+            if length > 3.0 * math.hypot(w.x - x, w.y - y) + 4.0:
+                continue
+            pts = [m.to_xy(rc[0], rc[1]) for rc in _simplify(free, path)[1:-1]]
+            if not pts:
+                continue  # garis lurus ke titik itu = jalan yang sama yang terhalang; bukan jalan memutar
+            detour = [Waypoint(x=px_, y=py_, hard_corner=True) for px_, py_ in pts]
+            self.waypoints = self.waypoints[: self.current_index] + detour + self.waypoints[j:]
+            self.wp_kinds = self.wp_kinds[: self.current_index] + ["detour"] * len(detour) + self.wp_kinds[j:]
+            self.get_logger().warn(
+                f"Terhalang -- jalan memutar {length:.1f} m lewat {len(detour)} titik, "
+                f"lalu lanjut rute di titik {self.current_index + len(detour) + 1}/{len(self.waypoints)}."
+            )
+            self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+            self._enter(DriveState.TURNING)
+            return True
+        self.get_logger().warn("Terhalang -- belum ada jalan memutar, menunggu.", throttle_duration_sec=2.0)
+        return False
+
+    def _dynamic_blocker(self) -> bool:
+        """Ada benda BARU (tidak ada di peta, di dalam batas) di jalur badan depan?
+        Dinding peta dan garis batas (dinding virtual) dianggap bukan halangan baru."""
+        scan = self.real_scan
+        if scan is None or self.grid_map is None or self.current_pose is None:
+            return True
+        m = self.grid_map
+        x, y, yaw = self.current_pose
+        r = np.asarray(scan.ranges, dtype=float)
+        a = self.laser_yaw_rad + scan.angle_min + scan.angle_increment * np.arange(len(r))
+        ok = np.isfinite(r) & (r > scan.range_min)
+        fx, fy = r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])
+        near = (fx > 0.0) & (fx < self.front_stop_from_lidar_m + self.front_clear_margin_m) & (
+            np.abs(fy) < self.front_guard_half_width_m)
+        if not np.any(near):
+            return False
+        wx = x + fx[near] * math.cos(yaw) - fy[near] * math.sin(yaw)
+        wy = y + fx[near] * math.sin(yaw) + fy[near] * math.cos(yaw)
+        rr = ((wy - m.oy) / m.res).astype(int)
+        cc = ((wx - m.ox) / m.res).astype(int)
+        inside = (rr >= 0) & (rr < m.h) & (cc >= 0) & (cc < m.w)
+        static = np.ones(len(wx), dtype=bool)
+        static[inside] = self.static_occ[rr[inside], cc[inside]]
+        if len(self.boundary) >= 3:
+            from matplotlib.path import Path
+            outside = ~Path(self.boundary).contains_points(np.stack([wx, wy], axis=1), radius=-0.1)
+            static |= outside
+        return int(np.count_nonzero(~static)) >= 2
+
+    def _near_row_end(self, within_m: float) -> bool:
+        i = self.current_index
+        while i < len(self.waypoints) - 1 and not self.waypoints[i].hard_corner:
+            i += 1
+        x, y, _ = self.current_pose
+        w = self.waypoints[i]
+        return math.hypot(w.x - x, w.y - y) <= within_m
+
+    def end_row_here(self) -> None:
+        """Dinding/batas di depan: baris ini selesai di posisi sekarang. Lompat ke
+        ujung baris (titik belok) lalu berputar ke titik sesudahnya."""
+        i = self.current_index
+        while i < len(self.waypoints) - 1 and not self.waypoints[i].hard_corner:
+            i += 1
+        x, y, _ = self.current_pose
+        self.waypoints[i] = Waypoint(x=x, y=y, hard_corner=True)  # ruas berikutnya mulai dari posisi nyata
+        self.current_index = min(i + 1, len(self.waypoints) - 1)
+        self.blocked_since = None
+        self.detour_attempts = 0
+        self.get_logger().info(
+            f"Dinding/batas di depan -- baris selesai di sini, lanjut ke titik {self.current_index + 1}/{len(self.waypoints)}.",
+            throttle_duration_sec=0.5,
+        )
+        self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+        self._enter(DriveState.TURNING)
+
+    def skip_rest_of_row(self) -> None:
+        if self.current_index < len(self.waypoints) - 1 and self.replan("Terhalang lama"):
+            return
+        self._skip_rest_of_row_plain()
+
+    def _skip_rest_of_row_plain(self) -> None:
+        """Terhalang terlalu lama di tengah baris: lompat ke titik setelah ujung
+        baris berikutnya, lalu berputar menghadap ke sana."""
+        if self.current_index >= len(self.waypoints) - 1:
+            # Titik terakhir (titik awal) terhalang terus: jangan coba tanpa henti.
+            self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+            self._enter(DriveState.FINISHED)
+            self.plan_status = "SELESAI -- titik awal terhalang, robot berhenti di dekatnya"
+            self.get_logger().warn("Titik awal terhalang terus -- robot berhenti di dekatnya. Pengepelan selesai.")
+            return
+        i = self.current_index
+        while i < len(self.waypoints) - 1 and not self.waypoints[i].hard_corner:
+            i += 1
+        self.current_index = min(i + 1, len(self.waypoints) - 1)
+        self.blocked_since = None
+        self.detour_attempts = 0
+        self.get_logger().warn(
+            f"Terhalang lebih dari {self.obstacle_skip_s:.0f}s -- sisa baris dilewati, "
+            f"lanjut ke titik {self.current_index + 1}/{len(self.waypoints)}."
+        )
+        self._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+        self._enter(DriveState.TURNING)
+
+    # ------------------------------------------------------------ tampilan
+    def _publish_path_marker(self) -> None:
+        """Baris pel = garis biru tebal, pindah/pulang = garis abu-abu tipis;
+        bagian yang sudah dilewati jadi hijau. Satu marker LINE_LIST per jenis."""
+        if not self.waypoints:
+            return
+        stamp = self.get_clock().now().to_msg()
+        start = self._mission_start_xy if self.state not in (DriveState.WAITING_POINTS,) else None
+        if start is None and self.current_pose is not None:
+            start = self.current_pose[:2]
+        prev = start or (self.waypoints[0].x, self.waypoints[0].y)
+        groups = {"pel": [], "pindah": [], "selesai": []}
+        for i, w in enumerate(self.waypoints):
+            kind = self.wp_kinds[i] if i < len(self.wp_kinds) else "row"
+            busy = self.state not in (DriveState.WAITING_POINTS, DriveState.FINISHED)
+            key = "selesai" if busy and i < self.current_index else ("pel" if kind == "row" else "pindah")
+            groups[key] += [Point(x=prev[0], y=prev[1], z=0.02), Point(x=w.x, y=w.y, z=0.02)]
+            prev = (w.x, w.y)
+        style = {"pel": (0, 0.06, (0.1, 0.45, 1.0, 0.95)),
+                 "pindah": (1, 0.02, (0.55, 0.55, 0.55, 0.7)),
+                 "selesai": (2, 0.06, (0.1, 0.8, 0.3, 0.8))}
+        for key, (mid, width, rgba) in style.items():
+            m = Marker()
+            m.header.frame_id = self.global_frame
+            m.header.stamp = stamp
+            m.ns, m.id, m.type = "rute_pengepelan", mid, Marker.LINE_LIST
+            m.action = Marker.ADD if groups[key] else Marker.DELETE
+            m.scale.x = width
+            m.color.r, m.color.g, m.color.b, m.color.a = rgba
+            m.pose.orientation.w = 1.0
+            m.points = groups[key]
+            self.path_viz_pub.publish(m)
+
+    def _publish_boundary_marker(self) -> None:
+        m = Marker()
+        m.header.frame_id = self.global_frame
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns, m.id, m.type = "batas_area", 0, Marker.LINE_STRIP
+        pts = self.boundary + (self.boundary[:1] if len(self.boundary) >= 3 else [])
+        m.action = Marker.ADD if len(pts) >= 2 else Marker.DELETE
+        m.scale.x = 0.08
+        m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.1, 0.1, 0.95
+        m.pose.orientation.w = 1.0
+        m.points = [Point(x=x, y=y, z=0.05) for x, y in pts]
+        self.path_viz_pub.publish(m)
+        d = Marker()
+        d.header = m.header
+        d.ns, d.id, d.type = "batas_area", 1, Marker.SPHERE_LIST
+        d.action = Marker.ADD if self.boundary else Marker.DELETE
+        d.scale.x = d.scale.y = d.scale.z = 0.18
+        d.color.r, d.color.g, d.color.b, d.color.a = 1.0, 0.1, 0.1, 0.95
+        d.pose.orientation.w = 1.0
+        d.points = [Point(x=x, y=y, z=0.05) for x, y in self.boundary]
+        self.path_viz_pub.publish(d)
+
+
+def main() -> None:
+    rclpy.init()
+    node = PengepelNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._publish_motor(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+image: peta_baru.pgm
+mode: trinary
+resolution: 0.050
+origin: [-15.157, -11.792, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

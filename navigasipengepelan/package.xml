@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>navigasipengepelan</name>
+  <version>0.1.0</version>
+  <description>Robot mengepel seluruh area kosong peta secara otomatis (zig-zag / boustrophedon coverage), lalu kembali ke titik awal. Cara jalan memakai logika robotfixproblemkembali3 (turunan kelasnya, tidak diubah); posisi awal dari deteksilokasi; peta, filter scan dan setting AMCL dari robotpel apa adanya.</description>
+  <maintainer email="ahmaddzikrullahfreedomjayakusu@gmail.com">robot</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <exec_depend>robotfixproblemkembali3</exec_depend>
+  <exec_depend>deteksilokasi</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>rplidar_ros</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
